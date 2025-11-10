@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 import base64
 from dataclasses import dataclass
 import json
@@ -120,15 +121,16 @@ _TYPE_INFORMATION_MAPPINGS: dict[DPType, type[TypeInformation]] = {
 }
 
 
-@dataclass
-class DPCodeWrapper:
+class DPCodeWrapper(ABC):
     """Base DPCode wrapper.
 
     Used as a common interface for referring to a DPCode, and
     access read conversion routines.
     """
 
-    dpcode: str
+    def __init__(self, dpcode: str) -> None:
+        """Init DPCodeWrapper."""
+        self.dpcode = dpcode
 
     def _read_device_status_raw(self, device: CustomerDevice) -> Any | None:
         """Read the raw device status for the DPCode.
@@ -137,12 +139,32 @@ class DPCodeWrapper:
         """
         return device.status.get(self.dpcode)
 
+    @abstractmethod
     def read_device_status(self, device: CustomerDevice) -> Any | None:
-        """Read the device value for the dpcode."""
-        raise NotImplementedError("read_device_value must be implemented")
+        """Read the device value for the dpcode.
+
+        The raw device status is converted to a Home Assistant value.
+        """
+
+    @abstractmethod
+    def _convert_value_to_raw_value(self, device: CustomerDevice, value: Any) -> Any:
+        """Convert a Home Assistant value back to a raw device value.
+
+        This is called by `get_update_command` to prepare the value for sending
+        back to the device, and should be implemented in concrete classes.
+        """
+
+    def get_update_command(self, device: CustomerDevice, value: Any) -> dict[str, Any]:
+        """Get the update command for the dpcode.
+
+        The Home Assistant value is converted back to a raw device value.
+        """
+        return {
+            "code": self.dpcode,
+            "value": self._convert_value_to_raw_value(device, value),
+        }
 
 
-@dataclass
 class DPCodeBooleanWrapper(DPCodeWrapper):
     """Simple wrapper for boolean values.
 
@@ -155,12 +177,50 @@ class DPCodeBooleanWrapper(DPCodeWrapper):
             return raw_value
         return None
 
+    def _convert_value_to_raw_value(
+        self, device: CustomerDevice, value: Any
+    ) -> Any | None:
+        """Convert a Home Assistant value back to a raw device value."""
+        if value in (True, False):
+            return value
+        # Currently only called with boolean values
+        # Safety net in case of future changes
+        raise ValueError(f"Invalid boolean value `{value}`")
 
-@dataclass(kw_only=True)
-class DPCodeEnumWrapper(DPCodeWrapper):
+
+class DPCodeTypeInformationWrapper[T: TypeInformation](DPCodeWrapper):
+    """Base DPCode wrapper with Type Information."""
+
+    DPTYPE: DPType
+    type_information: T
+
+    def __init__(self, dpcode: str, type_information: T) -> None:
+        """Init DPCodeWrapper."""
+        super().__init__(dpcode)
+        self.type_information = type_information
+
+    @classmethod
+    def find_dpcode(
+        cls,
+        device: CustomerDevice,
+        dpcodes: str | DPCode | tuple[DPCode, ...],
+        *,
+        prefer_function: bool = False,
+    ) -> Self | None:
+        """Find and return a DPCodeTypeInformationWrapper for the given DP codes."""
+        if type_information := find_dpcode(  # type: ignore[call-overload]
+            device, dpcodes, dptype=cls.DPTYPE, prefer_function=prefer_function
+        ):
+            return cls(
+                dpcode=type_information.dpcode, type_information=type_information
+            )
+        return None
+
+
+class DPCodeEnumWrapper(DPCodeTypeInformationWrapper[EnumTypeData]):
     """Simple wrapper for EnumTypeData values."""
 
-    type_information: EnumTypeData
+    DPTYPE = DPType.ENUM
 
     def read_device_status(self, device: CustomerDevice) -> str | None:
         """Read the device value for the dpcode.
@@ -174,20 +234,42 @@ class DPCodeEnumWrapper(DPCodeWrapper):
             return raw_value
         return None
 
-    @classmethod
-    def find_dpcode(
-        cls,
-        device: CustomerDevice,
-        dpcodes: str | DPCode | tuple[DPCode, ...],
-        *,
-        prefer_function: bool = False,
-    ) -> Self | None:
-        """Find and return a DPCodeEnumWrapper for the given DP codes."""
-        if enum_type := find_dpcode(
-            device, dpcodes, dptype=DPType.ENUM, prefer_function=prefer_function
-        ):
-            return cls(dpcode=enum_type.dpcode, type_information=enum_type)
-        return None
+    def _convert_value_to_raw_value(self, device: CustomerDevice, value: Any) -> Any:
+        """Convert a Home Assistant value back to a raw device value."""
+        if value in self.type_information.range:
+            return value
+        # Guarded by select option validation
+        # Safety net in case of future changes
+        raise ValueError(
+            f"Enum value `{value}` out of range: {self.type_information.range}"
+        )
+
+
+class DPCodeIntegerWrapper(DPCodeTypeInformationWrapper[IntegerTypeData]):
+    """Simple wrapper for IntegerTypeData values."""
+
+    DPTYPE = DPType.INTEGER
+
+    def read_device_status(self, device: CustomerDevice) -> float | None:
+        """Read the device value for the dpcode.
+
+        Value will be scaled based on the Integer type information.
+        """
+        if (raw_value := self._read_device_status_raw(device)) is None:
+            return None
+        return raw_value / (10**self.type_information.scale)
+
+    def _convert_value_to_raw_value(self, device: CustomerDevice, value: Any) -> Any:
+        """Convert a Home Assistant value back to a raw device value."""
+        new_value = round(value * (10**self.type_information.scale))
+        if self.type_information.min <= new_value <= self.type_information.max:
+            return new_value
+        # Guarded by number validation
+        # Safety net in case of future changes
+        raise ValueError(
+            f"Value `{new_value}` (converted from `{value}`) out of range:"
+            f" ({self.type_information.min}-{self.type_information.max})"
+        )
 
 
 @overload
